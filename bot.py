@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import sys
 
 from aiogram import Bot, Dispatcher
@@ -28,7 +29,9 @@ async def on_startup(bot: Bot):
     logger.info(f"Bot successfully started as @{bot_info.username} (ID: {bot_info.id})")
     logger.info(f"Super Admins configured: {SUPER_ADMINS}")
 
-    await notify_admins_started(bot, bot_info.username)
+    # GitHub Actions'da har ~6 soatda qayta ishga tushadi - har safar xabar yubormaslik uchun
+    if os.getenv("NOTIFY_STARTUP", "1") != "0":
+        await notify_admins_started(bot, bot_info.username)
 
 async def notify_admins_started(bot: Bot, bot_username: str):
     """Bot ishga tushgani haqida barcha adminlarga xabar yuborish"""
@@ -71,7 +74,8 @@ async def main():
 
     logger.info("Starting polling...")
     try:
-        await bot.delete_webhook(drop_pending_updates=True)
+        # Qayta ishga tushish oralig'ida kelgan xabarlar yo'qolmasin
+        await bot.delete_webhook(drop_pending_updates=False)
         await dp.start_polling(bot)
     finally:
         await bot.session.close()

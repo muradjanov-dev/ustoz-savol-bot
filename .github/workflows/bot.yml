@@ -1,0 +1,111 @@
+name: Run bot 24/7
+
+# Bot GitHub Actions'da doimiy ishlaydi:
+# - har bir ishga tushish ~5 soat 45 daqiqa ishlaydi (GitHub limiti 6 soat),
+# - tugashidan oldin keyingi ishga tushishni o'zi chaqiradi (zanjir),
+# - concurrency tufayli bir vaqtda faqat bitta nusxa ishlaydi,
+# - SQLite baza actions/cache orqali bir ishga tushishdan keyingisiga o'tkaziladi,
+# - cron zaxira sifatida: zanjir uzilib qolsa, 30 daqiqa ichida qayta tiklaydi.
+
+on:
+  workflow_dispatch:
+    inputs:
+      notify:
+        description: "Adminlarga 'Bot ishlayapti' xabarini yuborish"
+        type: boolean
+        default: false
+  schedule:
+    - cron: "*/30 * * * *"
+  push:
+    branches: [main]
+
+concurrency:
+  group: bot-runner
+  # Yangi kod push qilinsa - eski nusxani to'xtatib yangisini darhol ishga tushiramiz
+  cancel-in-progress: ${{ github.event_name == 'push' }}
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 358
+    steps:
+      # Cron zaxirasi: agar bot allaqachon ishlayotgan bo'lsa yoki navbatda tursa, darhol chiqamiz
+      - name: Check if another run is active
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          active=$(gh run list -R "${{ github.repository }}" -w bot.yml --json databaseId,status \
+            -q "[.[] | select(.databaseId != ${{ github.run_id }}) | select(.status==\"in_progress\" or .status==\"queued\" or .status==\"pending\" or .status==\"waiting\")] | length")
+          echo "Active runs: $active"
+          if [ "$active" -gt 0 ]; then echo "skip=true" >> "$GITHUB_OUTPUT"; else echo "skip=false" >> "$GITHUB_OUTPUT"; fi
+
+      - uses: actions/checkout@v4
+        if: steps.guard.outputs.skip != 'true'
+
+      - uses: actions/setup-python@v5
+        if: steps.guard.outputs.skip != 'true'
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        if: steps.guard.outputs.skip != 'true'
+        run: pip install -r requirements.txt
+
+      - name: Restore database
+        if: steps.guard.outputs.skip != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: data/db.enc
+          key: botdb-latest-${{ github.run_id }}
+          restore-keys: botdb-
+
+      - name: Schedule next run (chain)
+        if: steps.guard.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # Keyingi run hozir navbatga qo'yiladi va concurrency tufayli shu run tugashi bilan boshlanadi
+        run: gh workflow run bot.yml -R "${{ github.repository }}" --ref main -f notify=false
+
+      - name: Run bot
+        if: steps.guard.outputs.skip != 'true'
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          SUPER_ADMINS: ${{ secrets.SUPER_ADMINS }}
+          DB_PATH: data/bot_database.sqlite3
+          NOTIFY_STARTUP: ${{ (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.notify)) && '1' || '0' }}
+          DB_KEY: ${{ secrets.DB_KEY }}
+        run: |
+          mkdir -p data
+          # Baza cache'da shifrlangan holda saqlanadi (public repo bo'lgani uchun)
+          if [ -f data/db.enc ]; then
+            openssl enc -d -aes-256-cbc -pbkdf2 -pass env:DB_KEY -in data/db.enc -out data/bot_database.sqlite3
+            echo "Database restored"
+          fi
+          # 5 soat 45 daqiqadan keyin SIGTERM - aiogram ohista to'xtaydi
+          timeout --signal=TERM --kill-after=60 345m python bot.py || code=$?
+          echo "Bot exited with code ${code:-0}"
+          # 124 = timeout bilan to'xtatildi (normal holat)
+          if [ "${code:-0}" != "0" ] && [ "${code:-0}" != "124" ]; then exit "$code"; fi
+
+      - name: Encrypt database
+        id: enc
+        if: always() && steps.guard.outputs.skip != 'true' && hashFiles('data/bot_database.sqlite3') != ''
+        env:
+          DB_KEY: ${{ secrets.DB_KEY }}
+        run: openssl enc -aes-256-cbc -pbkdf2 -salt -pass env:DB_KEY -in data/bot_database.sqlite3 -out data/db.enc
+
+      - name: Save database
+        if: always() && steps.enc.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: data/db.enc
+          key: botdb-${{ github.run_id }}-${{ github.run_attempt }}

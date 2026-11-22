@@ -4,3 +4,5 @@ __pycache__/
 *.pyc
 venv/
 .venv/
+.db_key_backup
+data/
